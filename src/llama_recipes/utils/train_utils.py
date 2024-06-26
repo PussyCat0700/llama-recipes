@@ -93,7 +93,15 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     if train_config.enable_fsdp:
         world_size = int(os.environ["WORLD_SIZE"])
 
+    import builtins as __builtin__
 
+    builtin_print = __builtin__.print
+
+    def print(*args, **kwargs):
+        if local_rank == 0:
+            builtin_print(*args, **kwargs)
+
+    __builtin__.print = print
 
     autocast = torch.cuda.amp.autocast if train_config.use_fp16 else nullcontext
     train_prep = []
@@ -110,18 +118,17 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         val_step_loss = []
         val_step_perplexity = []
 
-    epoch_times = []
     checkpoint_times = []
     results = {}
     best_val_loss = float("inf")
     total_train_steps = 0
     max_steps_reached = False  # Flag to indicate max training steps reached
+    total_train_time = time.perf_counter()
     # Start the training loop
     for epoch in range(train_config.num_epochs):
         # stop when the maximum number of training steps is reached
         if max_steps_reached:
             break
-        epoch_start_time = time.perf_counter()
         with MemoryTrace() as memtrace:  # track the memory usage
             model.train()
             total_loss = 0.0
@@ -131,6 +138,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                 for step, batch in enumerate(train_dataloader):
                     total_train_steps += 1
                     # stop when the maximum number of training steps is reached
+                    train_time0 = time.perf_counter()
                     if train_config.max_train_step > 0 and total_train_steps > train_config.max_train_step:
                         max_steps_reached = True
                         if not train_config.enable_fsdp or local_rank==0:
@@ -192,15 +200,20 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                                 'train/step': epoch * len(train_dataloader) + step,
                                 'train/loss': loss.detach().float(),
                             })
-
-                    pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()})")
+                    iter_time = time.perf_counter() - train_time0
+                    print(json.dumps({"train":
+                        {
+                            "epoch": epoch+1, 
+                            "global_step": epoch * len(train_dataloader) + step, 
+                            "loss": loss.float().item(),
+                            "iter_time": iter_time,
+                            "timestamp": time.time()
+                        }}))
 
                     if train_config.save_metrics:
                         save_to_json(metrics_filename, train_step_loss, train_loss, train_step_perplexity, train_prep, val_step_loss, val_loss, val_step_perplexity, val_prep)
                 pbar.close()
 
-        epoch_end_time = time.perf_counter()-epoch_start_time
-        epoch_times.append(epoch_end_time)
         # Reducing total_loss across all devices if there's more than one CUDA device
         if is_xpu_available() and (torch.xpu.device_count() > 1 and train_config.enable_fsdp):
             dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
@@ -220,7 +233,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         # Update the learning rate as needed
         lr_scheduler.step()
         if train_config.run_validation:
-            eval_ppl, eval_epoch_loss, temp_val_loss, temp_step_perplexity = evaluation(model, train_config, eval_dataloader, local_rank, tokenizer, wandb_run)
+            eval_ppl, eval_epoch_loss, temp_val_loss, temp_step_perplexity = evaluation(model, epoch, train_config, eval_dataloader, local_rank, tokenizer, wandb_run)
             if train_config.save_metrics:
                 val_step_loss.extend(temp_val_loss)
                 val_step_perplexity.extend(temp_step_perplexity)
@@ -279,15 +292,16 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
             val_prep.append(float(eval_ppl))
         if train_config.enable_fsdp:
             if rank==0:
-                print(f"Epoch {epoch+1}: train_perplexity={train_perplexity:.4f}, train_epoch_loss={train_epoch_loss:.4f}, epoch time {epoch_end_time}s")
+                print(f"Epoch {epoch+1}: train_perplexity={train_perplexity:.4f}, train_epoch_loss={train_epoch_loss:.4f}")
         else:
-            print(f"Epoch {epoch+1}: train_perplexity={train_perplexity:.4f}, train_epoch_loss={train_epoch_loss:.4f}, epoch time {epoch_end_time}s")
+            print(f"Epoch {epoch+1}: train_perplexity={train_perplexity:.4f}, train_epoch_loss={train_epoch_loss:.4f}")
 
         # Saving the results every epoch to plot later
         if train_config.save_metrics:
             save_to_json(metrics_filename, train_step_loss, train_loss, train_step_perplexity, train_prep, val_step_loss, val_loss, val_step_perplexity, val_prep)
 
-    avg_epoch_time = sum(epoch_times)/ len(epoch_times)
+    total_train_time = time.perf_counter() - total_train_time
+    print(json.dumps({"total_train_time": iter_time,}))
     avg_checkpoint_time = sum(checkpoint_times)/ len(checkpoint_times) if len(checkpoint_times) > 0 else 0
     avg_train_prep = sum(train_prep)/len(train_prep)
     avg_train_loss = sum(train_loss)/len(train_loss)
@@ -300,7 +314,6 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     if train_config.run_validation:
         results['avg_eval_prep'] = avg_eval_prep
         results['avg_eval_loss'] = avg_eval_loss
-    results["avg_epoch_time"] = avg_epoch_time
     results["avg_checkpoint_time"] = avg_checkpoint_time
     if train_config.save_metrics:
         results["metrics_filename"] = metrics_filename
@@ -312,7 +325,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
 
     return results
 
-def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb_run):
+def evaluation(model, epoch, train_config, eval_dataloader, local_rank, tokenizer, wandb_run):
     """
     Evaluates the model on the given dataloader
 
@@ -335,6 +348,7 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
     with MemoryTrace() as memtrace:
         for step, batch in enumerate(tqdm(eval_dataloader,colour="green", desc="evaluating Epoch", dynamic_ncols=True)):
             total_eval_steps += 1
+            train_time0 = time.perf_counter()
             # stop when the maximum number of eval steps is reached
             if train_config.max_eval_step > 0 and total_eval_steps > train_config.max_eval_step:
                 if not train_config.enable_fsdp or local_rank==0:
@@ -363,6 +377,13 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
             eval_preds.extend(
                 tokenizer.batch_decode(preds.detach().cpu().numpy(), skip_special_tokens=True)
             )
+            iter_time = time.perf_counter() - train_time0
+            print(json.dumps({"eval":{
+                                "epoch": epoch, 
+                                "global_step": step, 
+                                "iter_time": iter_time,
+                                "timestamp": time.time()
+                            }}))
 
     # If there's more than one CUDA device, reduce evaluation loss across all devices
     if is_xpu_available() and (torch.xpu.device_count() > 1 and train_config.enable_fsdp):
@@ -377,6 +398,15 @@ def evaluation(model,train_config, eval_dataloader, local_rank, tokenizer, wandb
     eval_ppl = torch.exp(eval_epoch_loss)
 
     # Print evaluation metrics
+    print(json.dumps({
+        "eval_result":{
+            "epoch":epoch,
+            "global_step":step,
+            "metric":{
+                "perplexity":eval_ppl.item(),
+            },
+        }
+    }))
     if train_config.enable_fsdp:
         if local_rank==0:
             print(f" {eval_ppl=} {eval_epoch_loss=}")

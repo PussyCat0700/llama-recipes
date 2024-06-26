@@ -1,9 +1,11 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
 
+import json
 import os
 
 import dataclasses
+import time
 import fire
 import random
 import torch
@@ -108,6 +110,7 @@ def main(**kwargs):
         overhead and currently requires latest nightly.
         """
         if rank == 0:
+            load_time = time.perf_counter()
             model = LlamaForCausalLM.from_pretrained(
                 train_config.model_name,
                 load_in_8bit=True if train_config.quantization else None,
@@ -115,6 +118,8 @@ def main(**kwargs):
                 use_cache=use_cache,
                 attn_implementation="sdpa" if train_config.use_fast_kernels else None,
             )
+            load_time = time.perf_counter() - load_time
+            print(json.dumps({"load_model_time": load_time}))
         else:
             llama_config = LlamaConfig.from_pretrained(train_config.model_name)
             llama_config.use_cache = use_cache
