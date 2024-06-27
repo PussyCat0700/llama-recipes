@@ -102,6 +102,7 @@ def main(**kwargs):
 
     # Load the pre-trained model and setup its configuration
     use_cache = False if train_config.enable_fsdp else None
+    load_time = time.perf_counter()
     if train_config.enable_fsdp and train_config.low_cpu_fsdp:
         """
         for FSDP, we can save cpu memory by loading pretrained model on rank0 only.
@@ -109,8 +110,7 @@ def main(**kwargs):
         model alone would consume 2+TB cpu mem (70 * 4 * 8). This will add some comms
         overhead and currently requires latest nightly.
         """
-        if rank == 0:
-            load_time = time.perf_counter()
+        if rank == 0:            
             model = LlamaForCausalLM.from_pretrained(
                 train_config.model_name,
                 load_in_8bit=True if train_config.quantization else None,
@@ -118,8 +118,6 @@ def main(**kwargs):
                 use_cache=use_cache,
                 attn_implementation="sdpa" if train_config.use_fast_kernels else None,
             )
-            load_time = time.perf_counter() - load_time
-            print(json.dumps({"load_model_time": load_time}))
         else:
             llama_config = LlamaConfig.from_pretrained(train_config.model_name)
             llama_config.use_cache = use_cache
@@ -134,6 +132,8 @@ def main(**kwargs):
             use_cache=use_cache,
             attn_implementation="sdpa" if train_config.use_fast_kernels else None,
         )
+    load_time = time.perf_counter() - load_time
+    print(json.dumps({"load_model_time": load_time}))
 
     # Load the tokenizer and add special tokens
     tokenizer = AutoTokenizer.from_pretrained(train_config.model_name if train_config.tokenizer_name is None else train_config.tokenizer_name)
