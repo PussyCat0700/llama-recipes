@@ -12,7 +12,6 @@ transformers>=4.40.0
 sentencepiece
 py7zr
 scipy
-optimum
 matplotlib
 gradio
 chardet
